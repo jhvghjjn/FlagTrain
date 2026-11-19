@@ -17,11 +17,12 @@ The baseline is Megatron-LM's ``megatron.core.activations.quick_gelu``, the
 vendor implementation this operator ports. Megatron defines it as the torch
 composition ``x * sigmoid(1.702 * x)`` wrapped in ``jit_fuser``
 (``torch.compile``); the composition is the vendor's own implementation, so it
-is a valid on-machine baseline. When Megatron-LM is not installed, that exact
-composition is timed instead. Timing, warmup and synchronization come from
-``benchmark/base.py`` (``triton.testing.do_bench`` in kernel mode).
-``--level core`` runs the small, medium and large shapes below;
-``--level comprehensive`` adds the extra shapes.
+is a valid on-machine baseline. When Megatron-LM cannot be loaded there is no
+on-machine baseline: ``torch_op`` is ``None`` and ``--base-data`` is the only
+comparison. A plain-torch composition is not timed as a substitute. Timing,
+warmup and synchronization come from ``benchmark/base.py``
+(``triton.testing.do_bench`` in kernel mode). ``--level core`` runs the small,
+medium and large shapes below; ``--level comprehensive`` adds the extra shapes.
 """
 
 import os
@@ -46,23 +47,19 @@ _CORE_SHAPES = [
 ]
 
 
-def quick_gelu_ref(x):
-    """Megatron-LM's ``quick_gelu`` body; timed when Megatron is unavailable."""
-    return x * torch.sigmoid(1.702 * x)
-
-
 def _load_mcore_quick_gelu():
-    """Megatron's ``quick_gelu``, or the composition it is defined as."""
+    """Megatron's ``quick_gelu``, or ``None`` when it cannot be loaded."""
     try:
         from megatron.core.activations import quick_gelu
-    except ImportError:
+    except Exception as exc:  # noqa: BLE001
         warnings.warn(
-            "Megatron-LM is unavailable; timing its torch composition as the "
-            "benchmark baseline",
+            f"Megatron-LM's quick_gelu could not be loaded ({exc!r}); no "
+            "on-machine baseline is timed, so --base-data is the only "
+            "comparison",
             RuntimeWarning,
             stacklevel=2,
         )
-        return quick_gelu_ref, "torch composition of megatron-core quick_gelu"
+        return None, "none (no on-machine baseline; --base-data is the only comparison)"
     return quick_gelu, "megatron-core quick_gelu (@jit_fuser)"
 
 

@@ -14,10 +14,11 @@
 """Performance benchmark for bias_swiglu_impl.
 
 The baseline is Megatron-LM's ``bias_swiglu_impl`` when megatron-core >= 0.20
-is installed. Older versions lack the clamp / SiTU arguments, so the
-main-branch implementation vendored at the end of this file is used instead and
-every variant stays compared against a compiled Megatron baseline. The
-``Baseline:`` line printed by the test records which one ran.
+is installed. Older versions lack the clamp / SiTU arguments, so there is no
+on-machine baseline for this operator: ``torch_op`` is ``None`` and
+``--base-data`` is the only comparison. A vendored torch composition is not
+timed as a substitute. The ``Baseline:`` line printed by the test records which
+baseline ran.
 
 Timing, warmup and synchronization come from ``benchmark/base.py``
 (``triton.testing.do_bench`` in kernel mode). ``--level core`` runs the shapes
@@ -29,7 +30,6 @@ import importlib.metadata
 import os
 import re
 import warnings
-from typing import Optional
 
 import pytest
 import torch
@@ -94,8 +94,8 @@ def _configure_torch_compile():
     saved_suppress = dynamo.suppress_errors
     # Hygon's installed torch and Triton disagree on Inductor's config format
     # (``instance_descriptor`` vs dict), so the compiled baseline cannot build.
-    # Fall back to eager while the vendored baseline is in use; once
-    # megatron-core >= 0.20 provides it, keep the normal compiled path.
+    # Fall back to eager on versions that predate the clamp/SiTU arguments;
+    # those versions have no native baseline here anyway.
     if flag_train.vendor_name == "hygon" and (
         _MCORE_VERSION_TUPLE is None or _MCORE_VERSION_TUPLE < _MCORE_MIN_VERSION
     ):
@@ -162,11 +162,6 @@ def bias_swiglu_input_fn(shape, dtype, device):
         yield (x, bias, variant)
 
 
-def torch_op(x, bias, variant):
-    """Installed Megatron >= 0.20, or the vendored main-branch copy."""
-    return _baseline_op(x, bias, **_VARIANT_KWARGS[variant])
-
-
 def train_op(x, bias, variant):
     """The operator under test."""
     return flag_train.megatron.bias_swiglu_impl(x, bias, **_VARIANT_KWARGS[variant])
@@ -194,138 +189,15 @@ def test_bias_swiglu_impl_perf():
     bench.run()
 
 
-# ===========================================================================
-# Appendix: vendored Megatron-LM baseline
-#
-# Source: NVIDIA Megatron-LM main branch, fetched 2026-10-28:
-#   https://github.com/NVIDIA/Megatron-LM/blob/main/megatron/core/fusions/fused_bias_swiglu.py
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. Apache-2.0.
-#
-# ``_load_baseline`` below picks this copy whenever megatron-core < 0.20 or is
-# not installed. The forward math is verbatim under ``fmt: off`` so it can be
-# re-synced with upstream; ``jit_fuser`` is replaced by ``torch.compile``,
-# ``F.`` is expanded to ``torch.nn.functional.``, and backward-only helpers are
-# omitted because this benchmark measures forward only. Benchmark baseline
-# only, never a correctness oracle. Delete this appendix once every supported
-# megatron-core is >= 0.20.
-# ===========================================================================
-
-jit_fuser = torch.compile
-
-
-@jit_fuser
-def swiglu(y):
-    """Performs SwiGLU (Swish-Gated Linear Unit) activation function.
-
-    Args:
-        y (torch.Tensor): Input tensor to be split into two halves along the last dimension.
-
-    Returns:
-        torch.Tensor: Result of SwiGLU activation: SiLU(y1) * y2, where y1, y2 are the split halves.
-    """
-    y_1, y_2 = torch.chunk(y, 2, -1)
-    return torch.nn.functional.silu(y_1) * y_2
-
-
-@jit_fuser
-def bias_swiglu(y, bias):
-    """Performs SwiGLU activation with bias addition.
-
-    Args:
-        y (torch.Tensor): Input tensor.
-        bias (torch.Tensor): Bias tensor to be added to input.
-
-    Returns:
-        torch.Tensor: Result of bias addition followed by SwiGLU activation.
-    """
-    y = y + bias
-    return swiglu(y)
-
-
-@jit_fuser
-def clamped_swiglu(y, clamp_value):
-    """Perform SwiGLU after clamping both halves of the input."""
-    dtype = y.dtype
-    y_1, y_2 = torch.chunk(y.to(torch.float32), 2, -1)
-    y_1 = y_1.clamp(min=None, max=clamp_value)
-    y_2 = y_2.clamp(min=-clamp_value, max=clamp_value)
-    res = torch.nn.functional.silu(y_1) * y_2
-    return res.to(dtype)
-
-
-@jit_fuser
-def bias_clamped_swiglu(y, bias, clamp_value):
-    """Perform clamped SwiGLU after bias addition."""
-    return clamped_swiglu(y + bias, clamp_value)
-
-
-@jit_fuser
-def _tanh_clamp_and_deriv(y: torch.Tensor, clamp_scale: float):
-    """Soft-clamps ``y`` and returns the clamp derivative alongside it, both in fp32."""
-    t = torch.tanh(y.float() / clamp_scale)
-    return clamp_scale * t, 1 - t * t
-
-
-@jit_fuser
-def situ_glu(y, gate_clamp_scale: float, linear_clamp_scale: Optional[float]):
-    """SiTU-GLU: ``s_g * tanh(y1 / s_g) * sigmoid(y1) * y2``, with ``y2`` optionally clamped."""
-    dtype = y.dtype
-    y_1, y_2 = torch.chunk(y, 2, -1)
-    c, _ = _tanh_clamp_and_deriv(y_1, gate_clamp_scale)
-    gate = c * torch.sigmoid(y_1)
-    if linear_clamp_scale is not None:
-        y_2, _ = _tanh_clamp_and_deriv(y_2, linear_clamp_scale)
-    return (gate * y_2).to(dtype)
-
-
-@jit_fuser
-def bias_situ_glu(
-    y, bias, gate_clamp_scale: float, linear_clamp_scale: Optional[float]
-):
-    """Bias addition followed by SiTU-GLU. The clamps act on the full pre-activation."""
-    return situ_glu(y + bias, gate_clamp_scale, linear_clamp_scale)
-
-
-def _vendored_baseline(
-    input,
-    bias,
-    fp8_input_store=False,
-    cpu_offload_input=False,
-    clamp_value=None,
-    gate_clamp_scale=None,
-    linear_clamp_scale=None,
-):
-    ori_shape = input.shape
-    assert len(ori_shape) in [2, 3]
-    assert gate_clamp_scale is not None or linear_clamp_scale is None
-    assert gate_clamp_scale is None or clamp_value is None
-    input = input.view(-1, ori_shape[-1])
-    if gate_clamp_scale is not None:
-        if bias is None:
-            out = situ_glu(input, gate_clamp_scale, linear_clamp_scale)
-        else:
-            out = bias_situ_glu(input, bias, gate_clamp_scale, linear_clamp_scale)
-    elif clamp_value is not None and clamp_value > 0:
-        if bias is None:
-            out = clamped_swiglu(input, clamp_value)
-        else:
-            out = bias_clamped_swiglu(input, bias, clamp_value)
-    elif bias is None:
-        out = swiglu(input)
-    else:
-        out = bias_swiglu(input, bias)
-    return out if len(ori_shape) == 2 else out.view(ori_shape[0], ori_shape[1], -1)
-
-
 def _load_baseline():
-    """Installed Megatron when it has the clamp/SiTU arguments, else vendored."""
+    """Installed Megatron when it has the clamp/SiTU arguments, else ``None``."""
     if _MCORE_VERSION_TUPLE is not None and _MCORE_VERSION_TUPLE >= _MCORE_MIN_VERSION:
         try:
             from megatron.core.fusions.fused_bias_swiglu import (
                 bias_swiglu_impl as installed,
             )
-        except ImportError as exc:
-            reason = f"megatron-core {_MCORE_VERSION} cannot import it: {exc}"
+        except Exception as exc:  # noqa: BLE001
+            reason = f"megatron-core {_MCORE_VERSION} cannot import it: {exc!r}"
         else:
             return installed, f"megatron-core {_MCORE_VERSION}"
     elif _MCORE_VERSION is None:
@@ -337,12 +209,21 @@ def _load_baseline():
         )
 
     warnings.warn(
-        f"{reason}; using the vendored main-branch implementation as the "
-        "benchmark baseline",
+        f"{reason}; no on-machine baseline is timed, so --base-data is the "
+        "only comparison. A torch composition is not used as a substitute.",
         RuntimeWarning,
         stacklevel=2,
     )
-    return _vendored_baseline, "vendored main-branch implementation"
+    return None, "none (no on-machine baseline; --base-data is the only comparison)"
 
 
-_baseline_op, _BASELINE = _load_baseline()
+_BASELINE_IMPL, _BASELINE = _load_baseline()
+
+
+def torch_op(x, bias, variant):
+    """Megatron-LM's ``bias_swiglu_impl`` with this row's variant kwargs."""
+    return _BASELINE_IMPL(x, bias, **_VARIANT_KWARGS[variant])
+
+
+if _BASELINE_IMPL is None:
+    torch_op = None
